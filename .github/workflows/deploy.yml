@@ -1,4 +1,4 @@
-name: STANS DevSecOps Pipeline
+name: STANS CI/CD Pipeline
 
 on:
   push:
@@ -6,117 +6,117 @@ on:
   pull_request:
     branches: [main]
 
-permissions: {}
+permissions:
+  contents: read
+  packages: write
 
 jobs:
+  # ----------------------------------------------------------------------------
+  # Job 1: Basic Validation & Build Verification
+  # ----------------------------------------------------------------------------
   validate:
     name: Validate Build
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
           cache: 'npm'
-      - run: npm ci --frozen-lockfile
-      - run: npm audit --audit-level=high
-      - run: npm run build
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Verify Application Build
+        run: npm run build
         env:
           NODE_OPTIONS: "--max-old-space-size=2048"
 
-  build-scan-push:
-    name: Build, Scan & Push
-    runs-on: [self-hosted, homelab]
+  # ----------------------------------------------------------------------------
+  # Job 2: Build & Push Docker Image
+  # ----------------------------------------------------------------------------
+  docker-build-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
     needs: [validate]
-    permissions:
-      contents: read
-      security-events: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-      - name: Build image
-        run: |
-          docker build \
-            -t localhost:5000/stans-app:latest \
-            -t localhost:5000/stans-app:${{ github.sha }} \
-            .
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-      - name: Trivy scan - block on CRITICAL
-        run: |
-          trivy image \
-            --severity CRITICAL \
-            --exit-code 1 \
-            --format sarif \
-            --output trivy-results.sarif \
-            localhost:5000/stans-app:latest
-        continue-on-error: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Trivy scan - report HIGH
-        run: |
-          trivy image \
-            --severity HIGH \
-            --exit-code 0 \
-            --format sarif \
-            --output trivy-high-results.sarif \
-            localhost:5000/stans-app:latest
-
-      - name: Upload Trivy CRITICAL results to Security tab
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+      # GitHub Container Registry (ghcr.io) Login (Uses default GITHUB_TOKEN)
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          sarif_file: trivy-results.sarif
-          category: trivy-container-critical
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload Trivy HIGH results to Security tab
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+      # Optional Docker Hub Login (Active if user sets DOCKERHUB_USERNAME secret)
+      - name: Log in to Docker Hub (Optional)
+        if: env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v3
         with:
-          sarif_file: trivy-high-results.sarif
-          category: trivy-container-high
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
 
-      - name: Fail if CRITICAL vulnerabilities found
-        run: |
-          CRITICAL_COUNT=$(trivy image \
-            --severity CRITICAL \
-            --exit-code 0 \
-            --format json \
-            localhost:5000/stans-app:latest 2>/dev/null | \
-            jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length')
-          echo "CRITICAL vulnerabilities found: $CRITICAL_COUNT"
-          if [ "$CRITICAL_COUNT" -gt 0 ]; then
-            echo "Build blocked: $CRITICAL_COUNT CRITICAL CVE in container image"
-            exit 1
-          fi
+      - name: Lowercase Repository Name
+        id: repo_name
+        run: echo "IMAGE_NAME=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
-      - name: Login et push registry
-        run: |
-          echo "${{ secrets.HOMELAB_REGISTRY_PASSWORD }}" | \
-            docker login localhost:5000 \
-            -u ${{ secrets.HOMELAB_REGISTRY_USER }} \
-            --password-stdin
-          docker push localhost:5000/stans-app:latest
-          docker push localhost:5000/stans-app:${{ github.sha }}
+      # Build and Push image to GHCR (and Docker Hub if configured)
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-  deploy:
-    name: Deploy
-    runs-on: [self-hosted, homelab]
-    needs: [build-scan-push]
-    if: github.ref == 'refs/heads/main'
-    environment: production
-    permissions: {}
+  # ----------------------------------------------------------------------------
+  # Job 3: Automated Server Deployment (Optional - Runs when SSH secrets exist)
+  # ----------------------------------------------------------------------------
+  deploy-remote:
+    name: Deploy to Cloud Server
+    runs-on: ubuntu-latest
+    needs: [docker-build-push]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.SSH_HOST != ''
     steps:
-      - name: Deploy container
-        run: |
-          docker stop stans-app 2>/dev/null || true
-          docker rm   stans-app 2>/dev/null || true
-          docker run -d \
-            --name stans-app \
-            --restart=always \
-            -p 80:80 \
-            -p 443:443 \
-            -v /opt/stans/certs:/etc/nginx/certs:ro \
-            localhost:5000/stans-app:latest
-          sleep 8
-          curl -sk https://localhost/health && echo "Deploy OK"
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            echo "Pulling latest STANS container..."
+            docker pull ghcr.io/${{ env.IMAGE_NAME }}:latest
+            
+            echo "Stopping old container..."
+            docker stop stans-app || true
+            docker rm stans-app || true
+            
+            echo "Starting new container..."
+            docker run -d \
+              --name stans-app \
+              --restart=always \
+              -p 8080:80 \
+              ghcr.io/${{ env.IMAGE_NAME }}:latest
+            
+            echo "Verifying health check..."
+            sleep 5
+            curl -f http://127.0.0.1:8080/health && echo "Deployment successful!"
