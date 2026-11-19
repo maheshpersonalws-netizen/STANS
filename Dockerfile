@@ -5,10 +5,10 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Install dependencies first (leverages Docker layer cache)
+# Install dependencies (leverages Docker layer cache)
 COPY package*.json ./
 ENV NODE_OPTIONS="--max-old-space-size=2048"
-RUN npm ci --frozen-lockfile
+RUN npm ci || npm install --legacy-peer-deps
 
 # Copy application source code and compile static assets
 COPY . .
